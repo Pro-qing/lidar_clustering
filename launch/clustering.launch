@@ -1,0 +1,12 @@
+<launch>
+    <!-- 设置指定的绝对路径作为默认值 -->
+    <arg name="config_path" default="/home/getq/lidar_filtering/src/lidar_clustering/params/lidar_cluster.yaml" />
+
+    <!-- 启动聚类节点 -->
+    <node pkg="lidar_clustering" type="cluster_node" name="lidar_clustering_node" output="screen">
+        
+        <!-- 将绝对路径传递给节点的 config_file 参数 -->
+        <param name="config_file" value="$(arg config_path)" />
+        
+    </node>
+</launch>
