@@ -46,7 +46,9 @@ public:
         : nh_(nh), config_file_path_(config_path) {
         
         // cloud_sub_ = nh_.subscribe("/points_raw", 1, &LidarClustering::cloudCallback, this);
-        cloud_sub_ = nh_.subscribe("/points_filter", 1, &LidarClustering::cloudCallback, this);
+        // cloud_sub_ = nh_.subscribe("/points_filter", 1, &LidarClustering::cloudCallback, this);
+        cloud_sub_ = nh_.subscribe("/local_voxel_map", 1, &LidarClustering::cloudCallback, this);
+
         marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/cluster_bounding_boxes", 1);
 
         loadConfig();
