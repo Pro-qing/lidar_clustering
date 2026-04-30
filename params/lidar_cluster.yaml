@@ -1,8 +1,8 @@
 # 聚类容忍度 (米)：点与点之间距离小于该值，视为同一个物体
-cluster_tolerance: 0.3
+cluster_tolerance: 0.5
 
 # 聚类最小点数：少于该点数的聚类将被视为噪点丢弃
-min_cluster_size: 3
+min_cluster_size: 8
 
 # 聚类最大点数：大于该点数的聚类将被截断或丢弃（比如一整面墙）
 max_cluster_size: 2000
