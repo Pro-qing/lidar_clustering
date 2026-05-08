@@ -2,6 +2,14 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/MarkerArray.h>
 
+// 新增：Autoware 消息格式
+#include <autoware_msgs/DetectedObjectArray.h>
+#include <autoware_msgs/DetectedObject.h>
+
+// 新增：TF2 用于偏航角转四元数
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -11,7 +19,6 @@
 #include <pcl/common/centroid.h>
 #include <pcl/filters/filter.h>
 
-// 引入 Eigen 库用于数学计算 (PCL已自带)
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
@@ -36,6 +43,7 @@ private:
     ros::NodeHandle nh_;
     ros::Subscriber cloud_sub_;
     ros::Publisher marker_pub_;
+    ros::Publisher autoware_pub_; // 新增: Autoware 消息发布者
     
     ClusterParams params_;
     std::mutex param_mutex_;
@@ -45,11 +53,13 @@ public:
     LidarClustering(ros::NodeHandle& nh, const std::string& config_path) 
         : nh_(nh), config_file_path_(config_path) {
         
-        // cloud_sub_ = nh_.subscribe("/points_raw", 1, &LidarClustering::cloudCallback, this);
-        // cloud_sub_ = nh_.subscribe("/points_filter", 1, &LidarClustering::cloudCallback, this);
+        // 接收已经处理后的点云
         cloud_sub_ = nh_.subscribe("/local_voxel_map", 1, &LidarClustering::cloudCallback, this);
 
         marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/cluster_bounding_boxes", 1);
+        
+        // 发布 Autoware 识别结果 到 /detection/lidar_detector/objects
+        autoware_pub_ = nh_.advertise<autoware_msgs::DetectedObjectArray>("/detection/lidar_detector/objects", 1);
 
         loadConfig();
 
@@ -130,50 +140,40 @@ public:
         ec.extract(cluster_indices);
 
         visualization_msgs::MarkerArray marker_array;
+        
+        // 新增: 初始化 Autoware 消息
+        autoware_msgs::DetectedObjectArray autoware_objects;
+        autoware_objects.header = cloud_msg->header;
+
         int cluster_id = 0;
 
         for (const auto& cluster : cluster_indices) {
             const std::vector<int>& indices = cluster.indices;
 
-            // ==========================================
-            // OBB 计算核心: 仅使用 XY 平面进行 PCA 分析
-            // ==========================================
-            
-            // 1. 计算聚类点云的质心
+            // --- 现有代码：计算质心与协方差矩阵 ---
             Eigen::Vector4f centroid;
             pcl::compute3DCentroid(*input_cloud, indices, centroid);
 
-            // 2. 计算 3x3 协方差矩阵
             Eigen::Matrix3f covariance;
             pcl::computeCovarianceMatrixNormalized(*input_cloud, indices, centroid, covariance);
 
-            // 3. 提取 2x2 的 XY 平面协方差矩阵 (忽略 Z 轴倾斜，让包围框始终贴地)
             Eigen::Matrix2f cov_xy = covariance.block<2,2>(0,0);
             
-            // 4. 计算特征向量与特征值
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(cov_xy, Eigen::ComputeEigenvectors);
-            // 默认特征值从小到大排序，col(1) 为最大特征值对应的特征向量 (即车辆的主方向)
             Eigen::Vector2f major_axis = solver.eigenvectors().col(1);
             
-            // 计算 Yaw 偏航角
             float yaw = std::atan2(major_axis.y(), major_axis.x());
 
-            // 5. 投影到主方向局部坐标系，求出精准的长宽界限 (零点云拷贝！)
             float min_x = 1e9, min_y = 1e9, min_z = 1e9;
             float max_x = -1e9, max_y = -1e9, max_z = -1e9;
 
-            // 旋转矩阵系数
             float cos_inv = std::cos(-yaw);
             float sin_inv = std::sin(-yaw);
 
             for (int idx : indices) {
                 const auto& pt = input_cloud->points[idx];
-                
-                // 平移到原点
                 float dx = pt.x - centroid.x();
                 float dy = pt.y - centroid.y();
-
-                // 旋转到局部坐标系
                 float local_x = dx * cos_inv - dy * sin_inv;
                 float local_y = dx * sin_inv + dy * cos_inv;
                 float local_z = pt.z;
@@ -186,51 +186,79 @@ public:
                 if (local_z > max_z) max_z = local_z;
             }
 
-            // 6. 计算局部坐标系下的中心点
             float local_center_x = (min_x + max_x) / 2.0f;
             float local_center_y = (min_y + max_y) / 2.0f;
             float local_center_z = (min_z + max_z) / 2.0f;
 
-            // 7. 将局部中心点转回全局坐标系
             float cos_yaw = std::cos(yaw);
             float sin_yaw = std::sin(yaw);
             float global_center_x = local_center_x * cos_yaw - local_center_y * sin_yaw + centroid.x();
             float global_center_y = local_center_x * sin_yaw + local_center_y * cos_yaw + centroid.y();
-            float global_center_z = local_center_z; // Z不受 XY 旋转影响
+            float global_center_z = local_center_z;
 
-        // 8. 构造可视化 Marker (使用线框模式 LINE_LIST)
+            // ========================================================
+            // 新增: 填充 Autoware DetectedObject
+            // ========================================================
+            autoware_msgs::DetectedObject obj;
+            obj.header = cloud_msg->header;
+            obj.id = cluster_id;
+            obj.valid = true;
+            obj.space_frame = cloud_msg->header.frame_id;
+            obj.label = "unknown"; 
+            obj.pose_reliable = true;
+            
+            // 1. 设置中心点坐标
+            obj.pose.position.x = global_center_x;
+            obj.pose.position.y = global_center_y;
+            obj.pose.position.z = global_center_z;
+
+            // 2. 将计算得出的 Yaw 角转换为四元数
+            tf2::Quaternion q;
+            q.setRPY(0, 0, yaw);
+            obj.pose.orientation.x = q.x();
+            obj.pose.orientation.y = q.y();
+            obj.pose.orientation.z = q.z();
+            obj.pose.orientation.w = q.w();
+
+            // 3. 设置包围框尺寸 (长、宽、高)
+            obj.dimensions.x = (max_x - min_x); 
+            obj.dimensions.y = (max_y - min_y);
+            obj.dimensions.z = (max_z - min_z);
+
+            // 4. (可选但推荐) 将当前聚类的点云放入 obj.pointcloud
+            // Autoware后续追踪模块(如卡尔曼滤波等)通常需要访问聚类内部原始点云
+            pcl::PointCloud<pcl::PointXYZI>::Ptr cluster_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+            pcl::copyPointCloud(*input_cloud, indices, *cluster_cloud);
+            pcl::toROSMsg(*cluster_cloud, obj.pointcloud);
+            obj.pointcloud.header = cloud_msg->header;
+
+            autoware_objects.objects.push_back(obj);
+
+            // ========================================================
+            // 现有代码: 填充 RViz Marker
+            // ========================================================
             visualization_msgs::Marker marker;
             marker.header = cloud_msg->header; 
             marker.ns = "clusters";
             marker.id = cluster_id++;
-            marker.type = visualization_msgs::Marker::LINE_LIST;  // 关键改变：变成线条列表
+            marker.type = visualization_msgs::Marker::LINE_LIST;
             marker.action = visualization_msgs::Marker::ADD;
-            
-            // 对于 LINE_LIST，Marker的位姿直接设为原点即可，因为我们会直接计算全局顶点坐标
             marker.pose.position.x = 0;
             marker.pose.position.y = 0;
             marker.pose.position.z = 0;
             marker.pose.orientation.w = 1.0;
-
-            // 线条的粗细 (单位: 米)
             marker.scale.x = 0.05; 
-
-            // 纯绿色，不透明
             marker.color.r = 0.0f; marker.color.g = 1.0f; marker.color.b = 0.0f; marker.color.a = 1.0f;
             marker.lifetime = ros::Duration(0.15);
 
-            // --- 计算线框的 8 个顶点 ---
-            // 算出半长、半宽、半高
             float hx = std::max(0.05f, (max_x - min_x) / 2.0f);
             float hy = std::max(0.05f, (max_y - min_y) / 2.0f);
             float hz = std::max(0.05f, (max_z - min_z) / 2.0f);
 
-            // 定义 8 个顶点在局部坐标系下的位置
             float l_x[8] = {hx, -hx, -hx, hx, hx, -hx, -hx, hx};
             float l_y[8] = {hy, hy, -hy, -hy, hy, hy, -hy, -hy};
             float l_z[8] = {-hz, -hz, -hz, -hz, hz, hz, hz, hz};
 
-            // 旋转并平移到全局坐标系
             geometry_msgs::Point p[8];
             for(int i = 0; i < 8; i++) {
                 p[i].x = l_x[i] * cos_yaw - l_y[i] * sin_yaw + global_center_x;
@@ -238,14 +266,12 @@ public:
                 p[i].z = l_z[i] + global_center_z;
             }
 
-            // --- 定义 12 条边 (由顶点索引配对) ---
             int lines[12][2] = {
-                {0,1}, {1,2}, {2,3}, {3,0}, // 底面 4 条边
-                {4,5}, {5,6}, {6,7}, {7,4}, // 顶面 4 条边
-                {0,4}, {1,5}, {2,6}, {3,7}  // 侧面 4 条立柱
+                {0,1}, {1,2}, {2,3}, {3,0},
+                {4,5}, {5,6}, {6,7}, {7,4},
+                {0,4}, {1,5}, {2,6}, {3,7}
             };
 
-            // 将连线压入 Marker
             for(int i = 0; i < 12; i++) {
                 marker.points.push_back(p[lines[i][0]]);
                 marker.points.push_back(p[lines[i][1]]);
@@ -254,7 +280,9 @@ public:
             marker_array.markers.push_back(marker);
         }
 
-        // 删除上一帧残影
+        // 新增: 发布 Autoware 消息
+        autoware_pub_.publish(autoware_objects);
+
         visualization_msgs::Marker delete_marker;
         delete_marker.action = visualization_msgs::Marker::DELETEALL;
         marker_array.markers.push_back(delete_marker);

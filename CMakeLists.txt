@@ -22,6 +22,9 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   visualization_msgs
+  autoware_msgs
+  tf2
+  tf2_geometry_msgs
 )
 
 find_package(PCL REQUIRED)
